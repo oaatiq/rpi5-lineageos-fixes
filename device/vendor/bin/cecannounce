@@ -1,0 +1,16 @@
+#!/vendor/bin/sh
+
+#
+# Announce the Pi to the TV once after boot (HDMI-CEC One Touch Play), so the
+# TV switches to this input. Runs as the init service "cecannounce"
+# (/vendor/etc/init/cecannounce.rc) once boot has completed.
+#
+# Undo: mount -o remount,rw /vendor
+#       rm /vendor/bin/cecannounce /vendor/etc/init/cecannounce.rc; reboot
+#
+
+L="log -p i -t cec-announce"
+
+# Give the HDMI control service time to settle after boot.
+sleep 25
+$L "sending One Touch Play: $(/system/bin/cmd hdmi_control onetouchplay 2>&1)"

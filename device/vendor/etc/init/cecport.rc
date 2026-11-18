@@ -1,0 +1,10 @@
+# Keeps persist.vendor.hdmi.cec_device on the HDMI port the TV is plugged into.
+# See /vendor/bin/cecport.
+service cecport /vendor/bin/cecport
+    class late_start
+    user root
+    group root
+    disabled
+
+on property:sys.boot_completed=1
+    start cecport

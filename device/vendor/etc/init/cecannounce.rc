@@ -1,0 +1,11 @@
+# Switches the TV to the Pi's HDMI input once after boot.
+# See /vendor/bin/cecannounce.
+service cecannounce /vendor/bin/cecannounce
+    class late_start
+    user root
+    group root
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1
+    start cecannounce

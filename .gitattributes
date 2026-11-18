@@ -1,0 +1,5 @@
+# Keep shell scripts and init files LF: they run on Android, and CRLF breaks them.
+device/** text eol=lf
+addon.d/** text eol=lf
+*.sh text eol=lf
+*.rc text eol=lf

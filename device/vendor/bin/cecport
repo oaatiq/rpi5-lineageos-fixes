@@ -1,0 +1,543 @@
+#!/vendor/bin/sh
+
+#
+# Keeps the HDMI CEC adapter and the HDMI audio output of the Pi 5 on the port the TV is plugged into.
+#   cec0 / hdmi0 = HDMI0 (DRM connector HDMI-A-1, the port next to USB-C power)
+#   cec1 / hdmi1 = HDMI1 (DRM connector HDMI-A-2)
+#
+# persist.vendor.hdmi.cec_device: the CEC HAL reads it only when it starts.
+#   Restarting just the CEC HAL does NOT work: Android's HdmiControlService keeps polling the dead HAL,
+#   throws a NullPointerException in HdmiCecController.nativeSendCecCommand, and system_server dies,
+#   which restarts the whole framework by accident (tested 2026-10-29). So the switch stops the framework
+#   first (zygote), restarts the HDMI and audio services while nothing polls them, and starts the
+#   framework again: about as disruptive as a reboot for the running apps, much faster, and no reboot.
+#   If the framework does not come back or the CEC HAL ends up on the wrong device, it falls back to
+#   the reboot.
+# persist.vendor.audio.device:    the audio HAL reads it when it starts. With the wrong port the output
+#   has no clock ("Timestamp stats n=0, err=...", frames written 0), the player's media clock races
+#   ahead, drops frames and sits in BUFFERING (picture 1 s, freeze 5 s, repeat). Restarting the audio
+#   services is enough on its own, no framework restart needed, and apps recover by themselves.
+#   Independently of the port, a watchdog (check_watchdog) restarts the audio services when the clock
+#   is stuck for any other reason.
+#
+# CEC-available self-heal (added 2026-11-02): the property can already say the right port (e.g. the
+# TV came up disconnected-then-connected, through a switch/extender or just a slow HPD, while
+# persist.vendor.hdmi.cec_device was left over from before) while the CEC HAL itself is stuck --
+# HdmiControlService reports mIsCecAvailable: false and sends fail with "Machine is not on the
+# network" -- so the port-mismatch branch below never fires and nothing would otherwise recover.
+# check_cec_available() runs the same soft_switch recovery when the port already matches but CEC
+# has been unavailable for AVAIL_STABLE polls in a row, one try per stuck episode.
+#
+# Announce on HDMI connect (added 2026-11-02): cecannounce sends One Touch Play once at boot, so a
+# TV that is plugged in or powered on AFTER the Pi has booted never gets told to switch to this
+# input. announce_if_needed() sends One Touch Play once each time a port goes from disconnected to
+# connected (and once after any soft_switch), gated on CEC being available, so plugging the cable in
+# or turning the TV on switches it -- not only a boot with the cable already in.
+#
+# Power sync with the TV (added 2026-11-14), for an LG with SIMPLINK + Auto Power Sync on and
+# Quick Start+ off (with Quick Start+ on, the TV never says it is off):
+#   TV off -> Pi sleeps: the TV broadcasts <Standby>. Android's playback device ignores it while it
+#     is the active source unless persist.sys.hdmi.keep_awake=false (its default keeps a wake lock,
+#     "HdmiCecLocalDevicePlayback", and refuses standby), so the script keeps that property false.
+#     It only takes effect when HdmiControlService starts, i.e. after the next reboot.
+#   No kernel suspend: that wake lock was also what kept the Pi out of suspend. This kernel offers
+#     deep suspend, and a Pi suspended that way drops off the network and does not come back without
+#     a power cycle (seen 2026-11-14). So the script holds the kernel wake lock $NOSUSPEND: Android
+#     still sleeps (screen and HDMI output off), the Pi stays up and on the network.
+#   TV on -> Pi wakes: on power-on the LG only asks for the Pi's power status, name and address; it
+#     sends no <Set Stream Path>, <Routing Change> or power key, so Android would stay asleep behind
+#     a black input. With Quick Start+ off the TV usually drops HDMI hotplug while off, so
+#     wake_if_tv_back() wakes Android when the port goes disconnected -> connected while it is
+#     asleep, and announce_if_needed() then switches the TV to the Pi. Sometimes the TV keeps hotplug
+#     up while off (seen 2026-11-14), so wake_if_tv_powered_on() also asks the TV for its CEC power
+#     status while Android sleeps and wakes it when the TV goes from standby to on.
+#     announce_if_needed() holds One Touch Play while Android sleeps, so it never turns the TV on to
+#     a black input.
+#
+# Runs as the init service "cecport" (/vendor/etc/init/cecport.rc) after boot.
+# Run by hand as "cecport once" to see what it sees without changing anything.
+#
+# Undo: mount -o remount,rw /vendor
+#       rm /vendor/bin/cecport /vendor/etc/init/cecport.rc
+#       setprop persist.sys.hdmi.keep_awake ""; reboot
+#
+
+: "${LOGFILE:=/data/local/tmp/cecport.log}"
+
+# Logs to logcat (tag cec-port) and to a file, because the framework restart this script can trigger
+# rotates the small logcat buffer and the lines would be gone. Past 100 KB the file is cut down to
+# its newest 200 lines.
+say() {
+  log -p i -t cec-port "$*"
+  echo "$(date "+%F %T") $*" >> $LOGFILE
+  if [ "$(wc -c < $LOGFILE)" -gt 100000 ]; then
+    tail -n 200 $LOGFILE > $LOGFILE.tmp && mv $LOGFILE.tmp $LOGFILE
+  fi
+}
+PROP=persist.vendor.hdmi.cec_device
+GUARD=persist.vendor.cec_port.guard
+AUDIO=persist.vendor.audio.device
+POLL=5
+STABLE=3
+AVAIL_STABLE=6
+NOSUSPEND=cec_no_suspend
+
+# Audio watchdog (check_watchdog): look every WD_EVERY polls; "stuck" is n = 0 with the error count up
+# by at least WD_GROW since the last look; at most WD_MAX restarts in a row, WD_GAP seconds apart.
+WD_EVERY=3
+WD_GROW=50
+WD_GAP=60
+WD_MAX=3
+
+# Framework tools. This shell has /vendor/bin first in PATH, whose dumpsys/service talk to the vendor
+# binder where the framework's services do not exist and wait for them forever, so use /system/bin and
+# a timeout so a stuck call can never freeze the watcher. (Overridable for testing.)
+: "${DUMPSYS:=timeout 5 /system/bin/dumpsys}"
+: "${SERVICE:=timeout 5 /system/bin/service}"
+: "${CMD:=timeout 10 /system/bin/cmd}"
+: "${CECCTL:=/vendor/bin/cec-ctl}"
+
+# Prints cec0 or cec1 for the port that is connected, nothing if neither or both are.
+wanted() {
+  a=$(cat /sys/class/drm/card*-HDMI-A-1/status 2>/dev/null)
+  b=$(cat /sys/class/drm/card*-HDMI-A-2/status 2>/dev/null)
+  if [ "$a" = connected ] && [ "$b" != connected ]; then
+    echo cec0
+  elif [ "$b" = connected ] && [ "$a" != connected ]; then
+    echo cec1
+  fi
+}
+
+# The audio device name that goes with a CEC adapter name.
+audio_for() {
+  case "$1" in
+    cec0) echo hdmi0 ;;
+    cec1) echo hdmi1 ;;
+  esac
+}
+
+# Prints /dev/cec0 or /dev/cec1: the adapter the running CEC HAL has open.
+cec_hal_device() {
+  ls -l /proc/$(pidof android.hardware.tv.hdmi.cec-service.rpi)/fd 2>/dev/null | grep -o '/dev/cec[0-9]' | head -1
+}
+
+# True if HdmiControlService currently reports the CEC HAL as available.
+cec_available() {
+  $DUMPSYS hdmi_control 2>/dev/null | grep -q "mIsCecAvailable: true"
+}
+
+stop_audio() {
+  stop audioserver
+  stop vendor.audio-rpi
+  stop vendor.audio-effect-rpi
+}
+
+start_audio() {
+  start vendor.audio-effect-rpi
+  start vendor.audio-rpi
+  sleep 2
+  start audioserver
+}
+
+restart_audio() {
+  stop_audio
+  sleep 1
+  start_audio
+}
+
+# Prints "<highest n> <highest err>" of the audio output threads' timestamp stats: n counts working
+# audio clock readings, err counts failures.
+audio_stats() {
+  st=$($DUMPSYS media.audio_flinger 2>/dev/null | grep "Timestamp stats" | sed -n 's/.*n=\([0-9]*\) .*err=\([0-9]*\).*/\1 \2/p')
+  maxn=0
+  maxe=0
+  set -- $st
+  while [ $# -ge 2 ]; do
+    [ "$1" -gt "$maxn" ] && maxn=$1
+    [ "$2" -gt "$maxe" ] && maxe=$2
+    shift 2
+  done
+  echo "$maxn $maxe"
+}
+
+# After restarting the audio services: with something playing, a working output shows n > 0 within a
+# few seconds and a broken one piles up errors. With nothing playing there is nothing to read.
+verify_audio() {
+  i=0
+  while [ $i -lt 5 ]; do
+    sleep 3
+    set -- $(audio_stats)
+    if [ "$1" -gt 0 ]; then
+      say "audio clock is working (n=$1 err=$2)"
+      return
+    fi
+    i=$((i + 1))
+  done
+  if [ "$2" -gt 20 ]; then
+    say "audio still not keeping time after the restart (n=$1 err=$2), check $AUDIO"
+  else
+    say "audio services restarted, nothing playing to check"
+  fi
+}
+
+# Waits up to $1 seconds for the framework to register its HDMI control service.
+wait_hdmi_service() {
+  i=0
+  while [ $i -lt "$1" ]; do
+    $SERVICE check hdmi_control 2>/dev/null | grep -q "Service hdmi_control: found" && return 0
+    sleep 2
+    i=$((i + 2))
+  done
+  return 1
+}
+
+# Switches CEC and audio to $want without a reboot (see the header). Returns 1 if it did not work.
+soft_switch() {
+  setprop $PROP $want
+  setprop $AUDIO "$(audio_for "$want")"
+  stop zygote
+  sleep 3
+  stop vendor.cec-rpi
+  stop vendor.hdmi-rpi
+  stop_audio
+  sleep 1
+  start vendor.hdmi-rpi
+  start vendor.cec-rpi
+  start_audio
+  sleep 1
+  start zygote
+
+  if ! wait_hdmi_service 90; then
+    say "the framework did not come back within 90 s"
+    return 1
+  fi
+  dev=$(cec_hal_device)
+  if [ "$dev" != "/dev/$want" ]; then
+    say "CEC HAL is on '$dev', wanted /dev/$want"
+    return 1
+  fi
+
+  # Advisory only: some monitors have no physical address in their EDID, which is fine.
+  i=0
+  pa=
+  while [ $i -lt 30 ]; do
+    pa=$($DUMPSYS hdmi_control 2>/dev/null | grep -o 'physical_address: 0x[0-9a-fA-F]*' | head -1)
+    [ -n "$pa" ] && break
+    sleep 2
+    i=$((i + 2))
+  done
+  say "framework is back, CEC HAL on $dev, HdmiControlService ${pa:-reports no physical address}"
+  announced=
+  return 0
+}
+
+if [ "$1" = once ]; then
+  w=$(wanted)
+  echo "TV on: $w  property: $(getprop $PROP)  guard: $(getprop $GUARD)  CEC HAL on: $(cec_hal_device)"
+  echo "audio wanted: $(audio_for "$w")  property: $(getprop $AUDIO)  clock (n err): $(audio_stats)"
+  echo "mIsCecAvailable: $(cec_available && echo true || echo false)"
+  exit 0
+fi
+
+while [ "$(getprop sys.boot_completed)" != 1 ]; do
+  sleep 2
+done
+say "watching HDMI ports, CEC on $(getprop $PROP), audio on $(getprop $AUDIO)"
+
+# Power sync (see the header). Only let the TV's <Standby> put Android to sleep once suspend is blocked.
+if echo $NOSUSPEND > /sys/power/wake_lock 2>/dev/null; then
+  say "holding kernel wake lock $NOSUSPEND: Android may sleep, the Pi will not suspend"
+  if [ "$(getprop persist.sys.hdmi.keep_awake)" != false ]; then
+    setprop persist.sys.hdmi.keep_awake false
+    say "set persist.sys.hdmi.keep_awake=false: the TV's Standby will put the Pi to sleep after the next reboot"
+  fi
+else
+  say "could not take kernel wake lock $NOSUSPEND: a TV Standby may suspend the Pi and drop it off the network"
+fi
+
+seen=
+count=0
+gaveup=
+aseen=
+acount=0
+atried=
+wd_poll=0
+wd_prev=
+wd_tries=0
+wd_last=0
+wd_gaveup=
+avail_seen=
+avail_count=0
+avail_gaveup=
+announced=
+tv_was_off=
+tv_standby_seen=
+
+# True while the CEC branch below is going to switch the port. It sets the audio port and restarts the
+# audio services itself, so doing that first would be wasted.
+switch_pending() {
+  [ "$want" != "$cur" ] && [ "$(getprop $GUARD)" != "$want" ]
+}
+
+# Audio follows the TV's port without a reboot. A value other than hdmi0/hdmi1 is a deliberate
+# choice and is left alone; an unset value is treated as hdmi0.
+check_audio() {
+  awant=$(audio_for "$want")
+  acur=$(getprop $AUDIO)
+  [ -z "$acur" ] && acur=hdmi0
+
+  if [ -z "$awant" ] || [ "$awant" = "$acur" ]; then
+    aseen=
+    acount=0
+    atried=
+    return
+  fi
+  case "$acur" in
+    hdmi0|hdmi1) ;;
+    *) return ;;
+  esac
+
+  if [ "$awant" = "$aseen" ]; then
+    acount=$((acount + 1))
+  else
+    aseen=$awant
+    acount=1
+  fi
+  [ $acount -lt $STABLE ] && return
+
+  # Already restarted the audio services for this port and it still does not match: don't loop.
+  [ "$atried" = "$awant" ] && return
+  atried=$awant
+
+  say "TV is on $want but audio is on $acur: switching to $awant and restarting the audio services"
+  setprop $AUDIO $awant
+  restart_audio
+  verify_audio
+}
+
+# Audio self-heal whatever the cause (the port mismatch above is only one): while no output thread has
+# a working clock (n = 0) the error count keeps climbing, which an idle output does not do. Then restart
+# the audio services, at most WD_MAX times in a row and WD_GAP seconds apart; it starts over once the
+# clock works or the errors stop growing (idle). Only runs while the audio port matches the TV's, and
+# never when some thread has a working clock, so a healthy playback is not touched.
+check_watchdog() {
+  wd_poll=$((wd_poll + 1))
+  [ $wd_poll -lt $WD_EVERY ] && return
+  wd_poll=0
+  [ "$(audio_for "$want")" = "$(getprop $AUDIO)" ] || return
+
+  set -- $(audio_stats)
+  wn=$1
+  we=$2
+  if [ "$wn" -gt 0 ]; then
+    wd_prev=
+    wd_tries=0
+    wd_gaveup=
+    return
+  fi
+  wprev=$wd_prev
+  wd_prev=$we
+  # First look since the last restart or since the clock last worked: only a baseline. It must not
+  # reset the try counter, or a clock that never recovers would be restarted forever.
+  [ -z "$wprev" ] && return
+  if [ "$we" -lt $((wprev + WD_GROW)) ]; then
+    wd_tries=0
+    wd_gaveup=
+    return
+  fi
+
+  if [ $wd_tries -ge $WD_MAX ]; then
+    [ -z "$wd_gaveup" ] && say "audio clock still stuck after $WD_MAX restarts (n=0, errors $wprev -> $we), leaving it"
+    wd_gaveup=1
+    return
+  fi
+  wnow=$(date +%s)
+  [ $((wnow - wd_last)) -lt $WD_GAP ] && return
+  wd_tries=$((wd_tries + 1))
+  wd_last=$wnow
+  say "audio clock stuck (n=0, errors $wprev -> $we): restarting the audio services (try $wd_tries of $WD_MAX)"
+  restart_audio
+  verify_audio
+  wd_prev=
+}
+
+# Self-heal for CEC stuck unavailable even though $PROP already names the connected port (e.g. HDMI
+# came up disconnected-then-connected while the property was left over from before). Only one
+# recovery attempt per stuck episode: it resets once CEC is available again or the port changes.
+check_cec_available() {
+  hc=$($DUMPSYS hdmi_control 2>/dev/null)
+  # No output: the framework is down or restarting, nothing to judge.
+  [ -z "$hc" ] && return
+  if echo "$hc" | grep -q "mIsCecAvailable: true"; then
+    avail_seen=
+    avail_count=0
+    avail_gaveup=
+    return
+  fi
+
+  if [ "$avail_seen" = "$want" ]; then
+    avail_count=$((avail_count + 1))
+  else
+    avail_seen=$want
+    avail_count=1
+  fi
+  [ $avail_count -lt $AVAIL_STABLE ] && return
+
+  # One recovery per stuck episode, kept even after a successful soft_switch so a CEC that stays
+  # unavailable cannot restart the framework in a loop; it re-arms once CEC is available again.
+  [ "$avail_gaveup" = "$want" ] && return
+  avail_gaveup=$want
+
+  say "CEC port already matches ($want) but mIsCecAvailable is false: switching anyway to recover"
+  if soft_switch; then
+    avail_seen=
+    avail_count=0
+    return
+  fi
+
+  say "recovery switch failed, falling back to a reboot"
+  sync
+  setprop sys.powerctl reboot,cec-port
+  sleep 60
+}
+
+# Sends One Touch Play once per connect session, so the TV switches to the Pi when the cable is
+# plugged in or the TV is turned on -- not only at boot, which cecannounce already covers. Gated on
+# CEC being available; re-armed when the port disconnects (want empty) or after a soft_switch, both
+# of which clear $announced.
+announce_if_needed() {
+  [ -z "$want" ] && return
+  # Not while Android sleeps: it would turn the TV on (or switch it) to a black input. It stays armed
+  # and goes out once Android is awake again.
+  case "$(wakefulness)" in
+    Asleep|Dozing) return ;;
+  esac
+  cec_available || return
+  [ "$announced" = "$want" ] && return
+  announced=$want
+  r=$($CMD hdmi_control onetouchplay 2>&1)
+  say "HDMI connected on $want, told the TV to switch (One Touch Play): $r"
+}
+
+# Prints Android's wakefulness: Awake, Asleep, Dozing or Dreaming (nothing while the framework is down).
+wakefulness() {
+  $DUMPSYS power 2>/dev/null | grep -m1 -o 'mWakefulness=[A-Za-z]*' | cut -d= -f2
+}
+
+# Wakes Android if it is asleep, and re-arms One Touch Play so the TV switches to the Pi.
+# $1 says why, for the log.
+wake_android() {
+  w=$(wakefulness)
+  case "$w" in
+    Asleep|Dozing)
+      $CMD input keyevent KEYCODE_WAKEUP >/dev/null 2>&1
+      sleep 2
+      announced=
+      say "$1 while Android was $w: woke it (now $(wakefulness))"
+      ;;
+  esac
+}
+
+# Wakes Android once when the TV's port comes back (disconnected -> connected, i.e. the TV was turned
+# on) while Android is asleep, because the TV itself sends nothing that wakes it (see the header).
+# Not at startup: $tv_was_off is only set once the port has been seen disconnected.
+wake_if_tv_back() {
+  [ -n "$tv_was_off" ] || return
+  tv_was_off=
+  wake_android "TV came back on $want"
+}
+
+# Prints the TV's CEC power status: 0 on, 1 standby, 2 standby -> on, 3 on -> standby; nothing if the
+# TV does not answer.
+tv_power() {
+  timeout 5 $CECCTL -d /dev/$want -s --to 0 --give-device-power-status 2>/dev/null \
+    | sed -n 's/.*pwr-state:.*(0x0\([0-3]\)).*/\1/p' | head -1
+}
+
+# For a TV that keeps HDMI hotplug up while off, where wake_if_tv_back never fires: while Android is
+# asleep, asks the TV for its power status every poll, and once the TV has said standby, wakes Android
+# when it says on. Only after a standby, so a Pi put to sleep by hand while the TV stays on stays asleep.
+wake_if_tv_powered_on() {
+  case "$(wakefulness)" in
+    Asleep|Dozing) ;;
+    *) tv_standby_seen=; return ;;
+  esac
+  case "$(tv_power)" in
+    1|3) tv_standby_seen=1 ;;
+    0|2)
+      if [ -n "$tv_standby_seen" ]; then
+        tv_standby_seen=
+        wake_android "TV turned on (CEC power status on) on $want"
+      fi
+      ;;
+  esac
+}
+
+while true; do
+  sleep $POLL
+  want=$(wanted)
+  cur=$(getprop $PROP)
+
+  # TV off or both ports connected: leave it alone.
+  if [ -z "$want" ]; then
+    seen=
+    count=0
+    aseen=
+    acount=0
+    avail_seen=
+    avail_count=0
+    avail_gaveup=
+    announced=
+    tv_was_off=1
+    continue
+  fi
+
+  wake_if_tv_back
+  wake_if_tv_powered_on
+
+  if ! switch_pending; then
+    check_audio
+    check_watchdog
+  fi
+
+  if [ "$want" = "$cur" ]; then
+    [ -n "$(getprop $GUARD)" ] && setprop $GUARD ""
+    seen=
+    count=0
+    gaveup=
+    check_cec_available
+    announce_if_needed
+    continue
+  fi
+
+  # Only act once the same port has been the only connected one for STABLE polls.
+  if [ "$want" = "$seen" ]; then
+    count=$((count + 1))
+  else
+    seen=$want
+    count=1
+  fi
+  [ $count -lt $STABLE ] && continue
+
+  # Already switched to this port once and it still does not match: don't loop.
+  if [ "$(getprop $GUARD)" = "$want" ]; then
+    [ "$gaveup" != "$want" ] && say "CEC still not on $want after trying, not trying again"
+    gaveup=$want
+    continue
+  fi
+
+  setprop $GUARD $want
+  say "TV is on $want but CEC is on $cur: switching without a reboot (stopping the framework)"
+  if soft_switch; then
+    seen=
+    count=0
+    continue
+  fi
+
+  say "switch failed, falling back to a reboot"
+  setprop $PROP $want
+  setprop $AUDIO "$(audio_for "$want")"
+  sync
+  setprop sys.powerctl reboot,cec-port
+  sleep 60
+done

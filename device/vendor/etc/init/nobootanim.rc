@@ -1,0 +1,4 @@
+# Skips the boot animation. Its play-until-complete ending (about 4-5 s) holds back
+# sys.boot_completed and the launcher. Undo: delete /vendor/etc/init/nobootanim.rc.
+on early-init
+    setprop debug.sf.nobootanimation 1
