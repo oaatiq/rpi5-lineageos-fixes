@@ -14,6 +14,12 @@ Two properties pin Android to one port, and the stock defaults are `cec0` and `h
 
 If your TV is on the other port, things break in ways that do not point at the cause.
 
+By design, according to the maintainer's reply in
+[issue #224](https://github.com/raspberry-vanilla/android_local_manifest/issues/224), the port is
+chosen in the ROM's Raspberry Pi settings (HDMI0 by default) and the device must be rebooted after
+changing it. The watcher below only automates following the cable; it is a convenience the stock
+build does not claim to offer.
+
 ## Remote keys ignored: the Pi reports STANDBY
 
 Symptom: the TV remote does nothing on the Pi although the CEC wire is fine.

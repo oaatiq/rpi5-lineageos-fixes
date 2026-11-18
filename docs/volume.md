@@ -1,4 +1,4 @@
-# HDMI audio is about 40 dB too quiet
+# HDMI audio is treated as a speaker: low volume steps are very quiet
 
 Symptom: with the same TV volume, the Pi is far quieter than the TV's own apps.
 
@@ -8,10 +8,16 @@ The audio HAL (vc4-hdmi cards 0 and 1) declares only `AUDIO_DEVICE_OUT_SPEAKER` 
 `/vendor/etc/audio_policy_configuration.xml`, so Android treats HDMI output as a variable-volume
 speaker instead of an HDMI device (which gets full-volume behaviour under CEC).
 
-`STREAM_MUSIC` has 25 steps. Out of the box the speaker index was 5 (20 %), and the speaker curve is
-`(1, -58 dB) (20, -40 dB) (60, -17 dB) (100, 0)`, so about -40 dB (about 1 % amplitude) went out of
-the HDMI port. On the TV side HDMI is a fixed-volume device, so the TV knob is its only control and
-cannot make up for it.
+`STREAM_MUSIC` has 25 steps, and the speaker curve is
+`(1, -58 dB) (20, -40 dB) (60, -17 dB) (100, 0)`. On the author's unit the speaker index was sitting
+at 5 (20 %), which is about -40 dB (about 1 % amplitude) at the HDMI port.
+
+Where that 5 came from is **not known**. The device tree's `ro.config.media_vol_default` is 20 of 25
+(80 %, roughly -8 dB by interpolating the curve above), the 5 survived a reboot, and no
+`setStreamVolume` call showed up after boot. So a fresh install is probably not that quiet. The
+general point stands: because HDMI is modelled as a speaker, the low and middle steps are attenuated
+far more than a TV's own apps are, and the TV knob cannot make up for it, since HDMI is a
+fixed-volume device on the TV side.
 
 ## Fix (a setting, no reboot)
 

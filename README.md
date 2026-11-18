@@ -6,8 +6,9 @@ hardware, and every item says what was tested and what was not.
 
 > **Unofficial and unaffiliated.** The ROM is the community build by KonstaKANG, which comes
 > from the Raspberry Vanilla device tree. The Pi 5 is not an official LineageOS device. These
-> are on-device patches and write-ups, not changes to the ROM sources. See
-> [docs/UPSTREAM.md](docs/UPSTREAM.md) for what a proper upstream fix would look like.
+> are on-device patches and write-ups, not changes to the ROM sources, and nothing here was built from
+> the device tree. See [docs/UPSTREAM.md](docs/UPSTREAM.md) for what was checked upstream and why this
+> is published as documentation for other users.
 
 ## Tested on
 
@@ -27,7 +28,7 @@ hardware, and every item says what was tested and what was not.
 | Same script: audio watchdog | Player freezes ("Prolonged buffering") when the audio HAL has no clock | Tested live; the give-up path only offline |
 | [`cecannounce`](docs/hdmi-cec-and-audio-port.md#cecannounce-switch-the-tv-to-the-pi-after-boot) | TV stays on its own input after the Pi boots | Tested by reboot |
 | [Diagnosis](docs/hdmi-cec-and-audio-port.md#remote-keys-ignored-the-pi-reports-standby): remote keys ignored | Pi's HDMI service sits in STANDBY while Android is awake | Diagnosed and fixed by hand; no automatic fix |
-| [Volume](docs/volume.md): about 40 dB too quiet | HDMI audio is treated as a speaker with a steep attenuation curve | Confirmed by ear |
+| [Volume](docs/volume.md): Pi far quieter than the TV's own apps | HDMI audio is treated as a speaker, so low steps are heavily attenuated (-40 dB at step 5 of 25) | Confirmed by ear on one unit |
 | [Boot time](docs/boot-time.md): `loglevel=3`, no boot animation | 28 s to `boot_completed` | One boot per change; treat the numbers as indicative |
 | [Network adb survives reboots](docs/system-tips.md#adb-over-the-network-after-a-reboot) | `adb` on :5555 vanishes after every reboot | Tested across a reboot |
 | [Surviving a ROM update](docs/system-tips.md#surviving-a-rom-update) | Updates rewrite `/vendor` and remove the scripts | `addon.d` script only simulated |
