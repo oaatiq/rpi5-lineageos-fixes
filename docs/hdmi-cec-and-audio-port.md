@@ -134,6 +134,34 @@ of everything above, code written in later sessions and **reviewed here by readi
   `wake_if_tv_*` calls, and run `setprop persist.sys.hdmi.keep_awake ""` and reboot to undo the
   property.
 
+### Fix: "Ethernet not connected" after a soft switch (2026-11-20)
+
+Seen on the author's unit: 14 s after Android went to sleep, `check_cec_available` found CEC
+unavailable and ran the soft switch. Afterwards the Pi showed "Ethernet not connected" with the
+cable in. The link was up at 1000 Mb/s and DHCP had given an address, but the `eth0` routing table
+was empty, so no traffic passed and Android never marked the network as validated. Only a reboot
+cleared it.
+
+Cause: when the framework crashes, init restarts `netd`, `wificond`, `cameraserver` and `media`
+with it (the `onrestart` lines of `init.zygote64.rc`). A `stop zygote` / `start zygote` skips
+them. `netd` kept the old framework's networks, and the new framework's Ethernet network got the
+same network id and no routes.
+
+The script now does two things differently:
+
+- `soft_switch` stops and starts `netd`, `wificond`, `cameraserver` and `media` while the
+  framework is down, as init does.
+- `check_cec_available` only counts while Android is awake. While Android sleeps, an unavailable
+  CEC is normal and no reason to restart anything.
+
+Tested on the author's unit: a later soft switch (Pi woken while the TV stayed off) restarted
+`netd` with the framework, and Ethernet kept its routes and its validated state. The LG remote
+still puts the Pi to sleep and wakes it.
+
+**Known limit:** `check_cec_available` still acts after `AVAIL_STABLE` polls (30 s) of an
+unavailable CEC while Android is awake. That happens when the Pi is woken while the TV stays off,
+and it then restarts the framework.
+
 ## cecannounce: switch the TV to the Pi after boot
 
 With `routing_control` on (`cmd hdmi_control cec_setting set routing_control 1`) the Pi switches
