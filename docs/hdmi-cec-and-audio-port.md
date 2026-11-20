@@ -163,6 +163,14 @@ Pi is awake and the TV is off or still starting, and at 30 s that alone restarte
 (seen when the Pi was woken while the TV stayed off). A CEC that is really stuck is now repaired
 after 5 minutes instead of 30 s.
 
+Before that, `check_cec_available` now tries a lighter repair: after `AVAIL_TOGGLE` polls (20 s)
+of an unavailable CEC while Android is awake, it turns HDMI-CEC off and on inside Android
+(`cmd hdmi_control cec_setting set hdmi_cec_enabled 0`, then `1`). Tested on the author's unit with
+the Pi woken while the TV was off: the TV turned on, CEC stayed unavailable, and after the toggle it
+was available again in about 7 s. Android was not restarted, Ethernet was untouched, and the Pi
+announced itself as the active source again. The framework restart stays as the fallback at
+5 minutes.
+
 ## cecannounce: switch the TV to the Pi after boot
 
 With `routing_control` on (`cmd hdmi_control cec_setting set routing_control 1`) the Pi switches
