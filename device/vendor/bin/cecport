@@ -25,8 +25,10 @@
 # persist.vendor.hdmi.cec_device was left over from before) while the CEC HAL itself is stuck --
 # HdmiControlService reports mIsCecAvailable: false and sends fail with "Machine is not on the
 # network" -- so the port-mismatch branch below never fires and nothing would otherwise recover.
-# check_cec_available() runs the same soft_switch recovery when the port already matches but CEC
-# has been unavailable for AVAIL_STABLE polls in a row, one try per stuck episode.
+# check_cec_available() first turns HDMI-CEC off and on inside Android once CEC has been
+# unavailable for AVAIL_TOGGLE polls in a row (back in about 7 s, without restarting anything), and
+# runs the same soft_switch recovery only if it is still unavailable after AVAIL_STABLE polls; each
+# at most once per stuck episode.
 #
 # Announce on HDMI connect (added 2026-11-02): cecannounce sends One Touch Play once at boot, so a
 # TV that is plugged in or powered on AFTER the Pi has booted never gets told to switch to this
@@ -82,6 +84,10 @@ STABLE=3
 # 60 polls = 5 minutes. CEC is also unavailable while the Pi is awake and the TV is off or still
 # starting; at 6 polls (30 s) that alone restarted the framework (2026-11-20).
 AVAIL_STABLE=60
+# 4 polls = 20 s. After a wake the Pi starts itself, the TV turns on and drops HDMI for a moment,
+# and CEC stays unavailable until repaired; turning HDMI-CEC off and on brought it back in about
+# 7 s with no restart (tested 2026-11-20).
+AVAIL_TOGGLE=4
 NOSUSPEND=cec_no_suspend
 
 # Audio watchdog (check_watchdog): look every WD_EVERY polls; "stuck" is n = 0 with the error count up
@@ -283,6 +289,7 @@ wd_gaveup=
 avail_seen=
 avail_count=0
 avail_gaveup=
+avail_toggled=
 announced=
 tv_was_off=
 tv_standby_seen=
@@ -383,7 +390,7 @@ check_cec_available() {
   # then only disturbs a sleeping Pi (it did on 2026-11-20 and took the Ethernet down with it).
   case "$(wakefulness)" in
     Awake) ;;
-    *) avail_seen=; avail_count=0; return ;;
+    *) avail_seen=; avail_count=0; avail_toggled=; return ;;
   esac
   hc=$($DUMPSYS hdmi_control 2>/dev/null)
   # No output: the framework is down or restarting, nothing to judge.
@@ -392,6 +399,7 @@ check_cec_available() {
     avail_seen=
     avail_count=0
     avail_gaveup=
+    avail_toggled=
     return
   fi
 
@@ -401,6 +409,18 @@ check_cec_available() {
     avail_seen=$want
     avail_count=1
   fi
+
+  # First the light repair: turn HDMI-CEC off and on. Android allocates the CEC address again and
+  # announces itself as the active source; apps keep running.
+  if [ $avail_count -ge $AVAIL_TOGGLE ] && [ "$avail_toggled" != "$want" ]; then
+    avail_toggled=$want
+    $CMD hdmi_control cec_setting set hdmi_cec_enabled 0 >/dev/null 2>&1
+    sleep 3
+    $CMD hdmi_control cec_setting set hdmi_cec_enabled 1 >/dev/null 2>&1
+    say "CEC unavailable for $((avail_count * POLL)) s on $want: turned HDMI-CEC off and on to recover"
+    return
+  fi
+
   [ $avail_count -lt $AVAIL_STABLE ] && return
 
   # One recovery per stuck episode, kept even after a successful soft_switch so a CEC that stays
@@ -507,6 +527,7 @@ while true; do
     avail_seen=
     avail_count=0
     avail_gaveup=
+    avail_toggled=
     announced=
     tv_was_off=1
     continue
