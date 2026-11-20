@@ -182,6 +182,24 @@ the TV to its input when it wakes from sleep, but not when it boots. `cecannounc
 Tested by reboot 2026-10-29: the Pi announced about 25 s after boot completed and the TV registered
 it as the active source.
 
+**Changed 2026-11-20: ask early, retry, confirm.** Waiting a fixed 25 s and asking once was slow
+and could miss a TV that was still starting up. `cecannounce` now asks as soon as
+`HdmiControlService` is up, reads the TV's CEC power status every 3 s, asks again while the TV is
+not on (for up to 60 s), and once the TV reports on asks one last time so it switches to the Pi's
+input. It stops if Android goes back to sleep. Each step goes to `/data/local/tmp/cecannounce.log`,
+readable over adb.
+
+Measured on the author's unit (LG TV, off before the reboot):
+
+| Since kernel start | Before | After |
+|---|---|---|
+| Android ready | 35 s | 19 s |
+| First request to the TV | 61 s | 21 s |
+| TV reports on | 73 s | ~35 s (third request; the first two went out while it was starting up) |
+
+Android's boot time varied between the two runs, so compare the gap from "Android ready" to "TV
+on": 38 s before, about 15 s after, most of it the TV's own start-up.
+
 It must be an **init `.rc` service, not an `init.d` script that backgrounds itself**: `sysinit` is a
 oneshot service and Android 16's init kills its process group when it exits, so a detached child
 never survives. The first attempt as `/vendor/etc/init.d/` ran fine by hand and never fired at boot.
