@@ -200,7 +200,19 @@ soft_switch() {
   stop vendor.cec-rpi
   stop vendor.hdmi-rpi
   stop_audio
+  # init restarts these with the framework when it crashes (onrestart in init.zygote64.rc), but not on
+  # a "stop zygote" / "start zygote". netd left running keeps the old framework's networks, and the
+  # new framework then gets an Ethernet network with no routes: "Ethernet not connected" with the cable
+  # in, until a reboot (seen 2026-11-20).
+  stop netd
+  stop wificond
+  stop cameraserver
+  stop media
   sleep 1
+  start netd
+  start wificond
+  start cameraserver
+  start media
   start vendor.hdmi-rpi
   start vendor.cec-rpi
   start_audio
@@ -365,6 +377,12 @@ check_watchdog() {
 # came up disconnected-then-connected while the property was left over from before). Only one
 # recovery attempt per stuck episode: it resets once CEC is available again or the port changes.
 check_cec_available() {
+  # Asleep, or with the TV in standby, CEC can be legitimately unavailable; restarting the framework
+  # then only disturbs a sleeping Pi (it did on 2026-11-20 and took the Ethernet down with it).
+  case "$(wakefulness)" in
+    Awake) ;;
+    *) avail_seen=; avail_count=0; return ;;
+  esac
   hc=$($DUMPSYS hdmi_control 2>/dev/null)
   # No output: the framework is down or restarting, nothing to judge.
   [ -z "$hc" ] && return
