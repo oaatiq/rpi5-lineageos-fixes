@@ -1,16 +1,79 @@
 #!/vendor/bin/sh
 
 #
-# Announce the Pi to the TV once after boot (HDMI-CEC One Touch Play), so the
-# TV switches to this input. Runs as the init service "cecannounce"
-# (/vendor/etc/init/cecannounce.rc) once boot has completed.
+# Turns the TV on and switches it to the Pi after each boot (HDMI-CEC One Touch Play), as early as
+# Android allows, and keeps asking until the TV says it is on. Runs as the init service
+# "cecannounce" (/vendor/etc/init/cecannounce.rc) once boot has completed.
+#
+# It used to wait a fixed 25 s and ask once. Measured 2026-11-20 with the TV off: Android was ready
+# 35 s after the kernel started, the TV was asked at 61 s and reported on at 73 s. Now it asks as
+# soon as HdmiControlService is up, checks the TV's power status every POLL seconds, asks again
+# while the TV is not on, and once the TV is on asks one last time so it switches to the Pi's input.
+# It stops after MAX_S seconds, or when Android goes to sleep (someone turned the TV off).
+#
+# Log: tag cec-announce and /data/local/tmp/cecannounce.log (readable over adb).
 #
 # Undo: mount -o remount,rw /vendor
 #       rm /vendor/bin/cecannounce /vendor/etc/init/cecannounce.rc; reboot
 #
 
-L="log -p i -t cec-announce"
+LOG=/data/local/tmp/cecannounce.log
+POLL=3
+MAX_S=60
 
-# Give the HDMI control service time to settle after boot.
-sleep 25
-$L "sending One Touch Play: $(/system/bin/cmd hdmi_control onetouchplay 2>&1)"
+: "${DUMPSYS:=timeout 5 /system/bin/dumpsys}"
+: "${CMD:=timeout 10 /system/bin/cmd}"
+: "${SERVICE:=timeout 5 /system/bin/service}"
+
+up() { cut -d' ' -f1 /proc/uptime; }
+say() {
+  log -p i -t cec-announce "$*"
+  echo "$(date '+%F %T') [+$(up) s] $*" >> $LOG
+  chmod 644 $LOG 2>/dev/null
+  if [ "$(wc -c < $LOG)" -gt 50000 ]; then
+    tail -n 100 $LOG > $LOG.tmp && mv $LOG.tmp $LOG
+  fi
+}
+
+# The TV's CEC power status as Android last heard it: 0 on, 1 standby, 2/3 changing, -1 or
+# nothing unknown.
+tv_power() {
+  $DUMPSYS hdmi_control 2>/dev/null | grep -m1 -o 'display_name: TV power_status: [-0-9]*' | grep -o '[-0-9]*$'
+}
+
+wakefulness() {
+  $DUMPSYS power 2>/dev/null | grep -m1 -o 'mWakefulness=[A-Za-z]*' | cut -d= -f2
+}
+
+otp() {
+  $CMD hdmi_control onetouchplay 2>&1 | tr '\n' ' '
+}
+
+# HdmiControlService is normally up by boot_completed; wait for it if not.
+i=0
+while [ $i -lt 30 ]; do
+  $SERVICE check hdmi_control 2>/dev/null | grep -q 'Service hdmi_control: found' && break
+  sleep 1
+  i=$((i + 1))
+done
+say "boot completed, HDMI control service up after ${i} s"
+
+start=$(date +%s)
+tries=0
+while [ $(( $(date +%s) - start )) -lt $MAX_S ]; do
+  case "$(wakefulness)" in
+    Asleep|Dozing)
+      say "Android went to sleep: stopped asking the TV"
+      exit 0
+      ;;
+  esac
+  p=$(tv_power)
+  if [ "$p" = 0 ]; then
+    say "TV reports on after $tries request(s); switching it to the Pi: $(otp)"
+    exit 0
+  fi
+  tries=$((tries + 1))
+  say "TV power status '${p:-unknown}', request $tries: $(otp)"
+  sleep $POLL
+done
+say "TV did not report on within $MAX_S s after $tries request(s)"
