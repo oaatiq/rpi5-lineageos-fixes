@@ -79,7 +79,9 @@ GUARD=persist.vendor.cec_port.guard
 AUDIO=persist.vendor.audio.device
 POLL=5
 STABLE=3
-AVAIL_STABLE=6
+# 60 polls = 5 minutes. CEC is also unavailable while the Pi is awake and the TV is off or still
+# starting; at 6 polls (30 s) that alone restarted the framework (2026-11-20).
+AVAIL_STABLE=60
 NOSUSPEND=cec_no_suspend
 
 # Audio watchdog (check_watchdog): look every WD_EVERY polls; "stuck" is n = 0 with the error count up
