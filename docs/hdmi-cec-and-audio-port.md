@@ -158,9 +158,10 @@ Tested on the author's unit: a later soft switch (Pi woken while the TV stayed o
 `netd` with the framework, and Ethernet kept its routes and its validated state. The LG remote
 still puts the Pi to sleep and wakes it.
 
-**Known limit:** `check_cec_available` still acts after `AVAIL_STABLE` polls (30 s) of an
-unavailable CEC while Android is awake. That happens when the Pi is woken while the TV stays off,
-and it then restarts the framework.
+`AVAIL_STABLE` is now 60 polls (5 minutes) instead of 6 (30 s). CEC is also unavailable while the
+Pi is awake and the TV is off or still starting, and at 30 s that alone restarted the framework
+(seen when the Pi was woken while the TV stayed off). A CEC that is really stuck is now repaired
+after 5 minutes instead of 30 s.
 
 ## cecannounce: switch the TV to the Pi after boot
 
